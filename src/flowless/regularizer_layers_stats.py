@@ -2,7 +2,7 @@
 
 import argparse
 from pathlib import Path
-
+from scipy.stats import ttest_rel
 import pandas as pd
 
 
@@ -52,7 +52,51 @@ def main():
         layer_summary["mean_forgetting_std"]
         .fillna(0.0)
     )
+    p_acc = []
+    p_forgetting = []
 
+    best_layer = (
+        layer_summary
+        .sort_values("final_avg_acc_mean", ascending=False)
+        .iloc[0]["layers"]
+    )
+
+    for _, row in layer_summary.iterrows():
+
+        layer = row["layers"]
+
+        if layer == best_layer:
+            p_acc.append(float("nan"))
+            p_forgetting.append(float("nan"))
+            continue
+
+        best = (
+            df[df.layers == best_layer]
+            .sort_values("seed")
+        )
+
+        current = (
+            df[df.layers == layer]
+            .sort_values("seed")
+        )
+
+        assert (best.seed.values == current.seed.values).all()
+
+        _, p1 = ttest_rel(
+            best.final_avg_acc,
+            current.final_avg_acc,
+        )
+
+        _, p2 = ttest_rel(
+            best.mean_forgetting,
+            current.mean_forgetting,
+        )
+
+        p_acc.append(p1)
+        p_forgetting.append(p2)
+
+    layer_summary["p_acc"] = p_acc
+    layer_summary["p_forgetting"] = p_forgetting
     layer_summary.to_csv(
         out_dir / "layer_summary.csv",
         index=False,
@@ -234,3 +278,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# To run ->  python src/flowless/regularizer_layers_stats.py \
+#     --results data/results/flowless/layers/mnist/random/results.csv

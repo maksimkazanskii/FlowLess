@@ -13,23 +13,13 @@ from torch.utils.data import DataLoader
 from src.models.mlp import MLP
 from src.datasets.datasets import Dataset
 
-
-
 ALGORITHM = "DER++"
-
-
 OUT = Path("data/results/flowless_derpp")
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 BATCH_SIZE = 256
 EPOCHS = 5
 LR = 1e-3
-
-
 LAYER = "layer3"
-
-
 
 def set_seed(seed):
     random.seed(seed)

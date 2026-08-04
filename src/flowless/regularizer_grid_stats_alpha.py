@@ -1,7 +1,11 @@
 import argparse
 from pathlib import Path
 import pandas as pd
-
+from scipy.stats import f_oneway
+from scipy.stats import friedmanchisquare
+from scipy.stats import ttest_rel
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import ttest_rel
 REQUIRED = {
     "seed",
     "memory_per_task",
@@ -14,7 +18,10 @@ def load_all(root: Path):
     if root.is_file():
         files = [root]
     else:
-        files = sorted(root.rglob("results.csv"))
+        if (root / "results_seed0.csv").exists():
+            files = sorted(root.glob("results_seed*.csv"))
+        else:
+            files = sorted(root.rglob("results.csv"))
 
     if not files:
         raise FileNotFoundError("No results.csv files found.")
@@ -96,16 +103,102 @@ def main():
         )
         .head(1)
     )
+    # -------------------------------------------------------
+    # Paired t-test against baseline (lambda=0)
+    # -------------------------------------------------------
 
+    p_acc = []
+    p_forgetting = []
+
+    for _, row in best.iterrows():
+
+        alpha = row["alpha"]
+        memory = row["memory_per_task"]
+        best_lambda = row["lambda_flux"]
+
+        # baseline
+        base = df[
+            (df.alpha == alpha) &
+            (df.memory_per_task == memory) &
+            (df.lambda_flux == 0.0)
+            ].sort_values("seed")
+
+        # best FlowLess
+        flow = df[
+            (df.alpha == alpha) &
+            (df.memory_per_task == memory) &
+            (df.lambda_flux == best_lambda)
+            ].sort_values("seed")
+
+        common = sorted(
+            set(base.seed).intersection(flow.seed)
+        )
+
+        base = (
+            base[base.seed.isin(common)]
+            .sort_values("seed")
+            .reset_index(drop=True)
+        )
+
+        flow = (
+            flow[flow.seed.isin(common)]
+            .sort_values("seed")
+            .reset_index(drop=True)
+        )
+
+        # Accuracy
+        _, p1 = ttest_rel(
+            flow.final_avg_acc,
+            base.final_avg_acc,
+        )
+
+        # Forgetting
+        _, p2 = ttest_rel(
+            flow.mean_forgetting,
+            base.mean_forgetting,
+        )
+
+        p_acc.append(p1)
+        p_forgetting.append(p2)
+
+    best["p_acc"] = p_acc
+    best["p_forgetting"] = p_forgetting
+    # -------------------------------------------------------
+    # Holm–Bonferroni correction
+    # -------------------------------------------------------
+
+    mask = best["p_acc"].notna()
+    best.loc[mask, "p_acc_holm"] = multipletests(
+        best.loc[mask, "p_acc"],
+        method="holm",
+    )[1]
+
+    mask = best["p_forgetting"].notna()
+    best.loc[mask, "p_forgetting_holm"] = multipletests(
+        best.loc[mask, "p_forgetting"],
+        method="holm",
+    )[1]
     best.to_csv(
         out / "best_lambda_by_alpha.csv",
         index=False,
         )
 
+
     print("\n" + "=" * 90)
     print("BEST LAMBDA PER ALPHA")
     print("=" * 90)
-    print(best.to_string(index=False))
+    print(
+        best.round(
+            {
+                "final_avg_acc_mean": 2,
+                "final_avg_acc_std": 2,
+                "mean_forgetting_mean": 2,
+                "mean_forgetting_std": 2,
+                "p_acc_holm": 4,
+                "p_forgetting_holm": 4,
+            }
+        ).to_string(index=False)
+    )
 
     # -------------------------------------------------------
     # Alpha summary (using best lambda only)
@@ -152,6 +245,91 @@ def main():
 
     print(f"\nSaved to {out}")
 
+    # -------------------------------------------------------
+    # Effect of alpha
+    # -------------------------------------------------------
+
+    print("\n" + "=" * 90)
+    print("EFFECT OF ALPHA")
+    print("=" * 90)
+
+    for memory in sorted(best.memory_per_task.unique()):
+
+        print(f"\nMemory per task = {memory}")
+
+        # best lambda for every alpha
+        subset = best[best.memory_per_task == memory]
+
+        # reconstruct per-seed results
+        seed_tables = []
+
+        for _, row in subset.iterrows():
+
+            alpha = row.alpha
+            lam = row.lambda_flux
+
+            values = (
+                df[
+                    (df.alpha == alpha)
+                    & (df.memory_per_task == memory)
+                    & (df.lambda_flux == lam)
+                    ][["seed", "final_avg_acc"]]
+                .rename(columns={"final_avg_acc": alpha})
+            )
+
+            seed_tables.append(values)
+
+        merged = seed_tables[0]
+
+        for t in seed_tables[1:]:
+            merged = merged.merge(t, on="seed")
+
+        merged = merged.sort_values("seed")
+
+        alpha_cols = [c for c in merged.columns if c != "seed"]
+
+        if len(alpha_cols) < 3:
+            print(f"Only {len(alpha_cols)} alpha value(s) found. Skipping Friedman test.")
+            continue
+
+        statistic, p = friedmanchisquare(
+            *[merged[c] for c in alpha_cols]
+        )
+
+        print(f"Overall Friedman p = {p:.6f}")
+
+        # Pairwise vs alpha = 0
+        if 0.0 in alpha_cols:
+
+            print("\nPairwise comparisons vs alpha = 0")
+
+            pvals = []
+            names = []
+
+            for a in alpha_cols:
+
+                if a == 0.0:
+                    continue
+
+                _, pp = ttest_rel(
+                    merged[0.0],
+                    merged[a]
+                )
+
+                pvals.append(pp)
+                names.append(a)
+
+            reject, pvals_corr, _, _ = multipletests(
+                pvals,
+                method="holm"
+            )
+
+            for a, p0, pc in zip(names, pvals, pvals_corr):
+                print(
+                    f"alpha={a:7.3f} "
+                    f"raw={p0:.5f} "
+                    f"holm={pc:.5f}"
+                )
 if __name__ == "__main__":
     main()
 

@@ -35,11 +35,15 @@ def load_results(path: Path):
     if path.is_file():
         files = [path]
     else:
-        files = sorted(path.rglob("results.csv"))
+        files = (
+                sorted(path.rglob("results.csv"))
+                + sorted(path.rglob("results_seed*.csv"))
+        )
 
     if not files:
-        raise FileNotFoundError("No results.csv found.")
-
+        raise FileNotFoundError(
+            f"No results.csv or results_seed*.csv found under: {path}"
+        )
     dfs = []
 
     for f in files:
@@ -93,7 +97,32 @@ def compute_best(df):
         .head(1)
         .reset_index(drop=True)
     )
+    print("\n================ BASELINE (ER) ================\n")
+    print(
+        baseline[
+            [
+                "memory_per_task",
+                "acc_mean",
+                "acc_std",
+                "forget_mean",
+                "forget_std",
+            ]
+        ].to_string(index=False)
+    )
 
+    print("\n================ FLOWLESS-R (best λ) ================\n")
+    print(
+        flowless[
+            [
+                "memory_per_task",
+                "lambda_flux",
+                "acc_mean",
+                "acc_std",
+                "forget_mean",
+                "forget_std",
+            ]
+        ].to_string(index=False)
+    )
     return baseline, flowless
 
 
@@ -135,7 +164,7 @@ def plot_metric(
         x,
         y,
         "-o",
-        label="ER + FlowLess",
+        label="ER + FlowLess-R",
     )
 
     plt.fill_between(

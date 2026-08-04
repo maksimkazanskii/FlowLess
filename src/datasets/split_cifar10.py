@@ -15,17 +15,7 @@ class SplitCIFAR10:
 
     def __init__(self, root="./data"):
 
-        train_transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.4914, 0.4822, 0.4465),
-                std=(0.2470, 0.2435, 0.2616),
-            ),
-        ])
-
-        test_transform = transforms.Compose([
+        transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=(0.4914, 0.4822, 0.4465),
@@ -37,14 +27,14 @@ class SplitCIFAR10:
             root=root,
             train=True,
             download=True,
-            transform=train_transform,
+            transform=transform,
         )
 
         self.test_dataset = datasets.CIFAR10(
             root=root,
             train=False,
             download=True,
-            transform=test_transform,
+            transform=transform,
         )
 
         self.train_tasks = []

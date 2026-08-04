@@ -11,26 +11,27 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.models.mlp import MLP
+from src.models.resnet import ResNet18
 from src.datasets.datasets import Dataset
 
-from sklearn.neighbors import NearestNeighbors
-from src.models.resnet import ResNet18
+
+
+ALGORITHM = "ER-ACE"
+
+
+OUT = Path("data/results/flowless_erace")
+
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
 
 def get_experiment_config(dataset_name):
 
     dataset_name = dataset_name.lower()
-
-    if dataset_name in {"tinyimagenet", "tiny_imagenet"}:
-        return {
-            "model_factory": lambda: ResNet18(num_classes=200),
-            "layer": "layer4",
-            "epochs": 80,
-            "batch_size": 128,
-            "eval_batch_size": 256,
-            "lr": 0.1,
-            "optimizer": "sgd",
-            "replay_weight": 10.0,
-        }
 
     if dataset_name == "mnist":
         return {
@@ -44,7 +45,10 @@ def get_experiment_config(dataset_name):
             "replay_weight": 2.0,
         }
 
-    if dataset_name in {"fashion_mnist"}:
+    if dataset_name in {
+        "fashion_mnist",
+        "fashionmnist",
+    }:
         return {
             "model_factory": lambda: MLP(),
             "layer": "layer3",
@@ -56,11 +60,13 @@ def get_experiment_config(dataset_name):
             "replay_weight": 2.0,
         }
 
-    if dataset_name in {"cifar10"}:
+    if dataset_name == "cifar10":
         return {
-            "model_factory": lambda: ResNet18(num_classes=10),
+            "model_factory": lambda: ResNet18(
+                num_classes=10
+            ),
             "layer": "layer4",
-            "epochs": 15,
+            "epochs": 40,
             "batch_size": 128,
             "eval_batch_size": 256,
             "lr": 0.1,
@@ -68,45 +74,20 @@ def get_experiment_config(dataset_name):
             "replay_weight": 2.0,
         }
 
+    if dataset_name == "tinyimagenet":
+        return {
+            "model_factory": lambda: ResNet18(num_classes=200),
+            "layer": "layer4",
+            "epochs": 40,
+            "batch_size": 128,
+            "eval_batch_size": 256,
+            "lr": 0.1,
+            "optimizer": "sgd",
+            "replay_weight": 2.0,
+        }
     raise ValueError(
         f"Unsupported dataset: {dataset_name}"
     )
-def compute_density(Z, k=10):
-
-    if len(Z) <= k:
-        return np.ones(len(Z))
-
-    nn = NearestNeighbors(n_neighbors=k + 1)
-    nn.fit(Z)
-
-    distances, _ = nn.kneighbors(Z)
-
-    distances = distances[:, 1:]
-
-    rho = k / (distances.sum(axis=1) + 1e-12)
-
-    return rho
-
-OUT = Path("data/results/flowless")
-
-DEVICE = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
-#DEVICE = "cpu"
-
-REPLAY_WEIGHT = 2.0
-LAMBDA_FLUX = 0.1
-lambda_grid = [0.0, 0.1, 0.3, 1.0, 3.0]
-
-# Density weighting:
-# alpha=0.0 gives the original unweighted FlowLess loss.
-DENSITY_EPS = 1e-12
-
-
 
 def set_seed(seed):
     random.seed(seed)
@@ -123,17 +104,13 @@ class FluxReplayBuffer:
             self,
             memory_per_task,
             layer,
-            density_weighting=False,
     ):
         self.memory_per_task = memory_per_task
-        self.density_weighting = density_weighting
+        self.layer = layer
 
         self.x = []
         self.y = []
         self.z_ref = []
-        self.rho = []
-
-        self.layer = layer
 
     def __len__(self):
         return len(self.x)
@@ -146,58 +123,27 @@ class FluxReplayBuffer:
 
         model.eval()
 
-        memory_size = min(
-            self.memory_per_task,
-            len(dataset),
-        )
+        k = min(self.memory_per_task, len(dataset))
 
-        # --------------------------------------------------
-        # Compute representations for the entire current task
-        # --------------------------------------------------
-        rho = None
-
-        if self.density_weighting:
-
-            # --------------------------------------------------
-            # Compute representations for the entire current task
-            # --------------------------------------------------
-            features = []
-
-            for i in range(len(dataset)):
-                x, _ = dataset[i]
-
-                xb = x.unsqueeze(0).to(DEVICE)
-
-                z = model.features(xb)[self.layer]
-                z = F.normalize(z, dim=1)
-
-                features.append(
-                    z.squeeze(0).cpu().numpy()
-                )
-
-            features = np.stack(features)
-
-            # Density of every sample in the current task
-            rho = compute_density(features)
-
-        # --------------------------------------------------
-        # Replay selection remains completely random
-        # --------------------------------------------------
         idx = np.random.choice(
             len(dataset),
-            size=memory_size,
+            size=k,
             replace=False,
         )
 
-        # --------------------------------------------------
-        # Store samples, reference features, and densities
-        # --------------------------------------------------
+        #
+        # Store selected samples
+        #
         for i in idx:
+
             x, y = dataset[i]
 
             xb = x.unsqueeze(0).to(DEVICE)
 
-            z_ref = (
+            #
+            # Store reference representation
+            #
+            z = (
                 model.features(xb)[self.layer]
                 .squeeze(0)
                 .detach()
@@ -206,13 +152,11 @@ class FluxReplayBuffer:
 
             self.x.append(x.clone())
             self.y.append(int(y))
-            self.z_ref.append(z_ref.clone())
+            self.z_ref.append(z.clone())
 
-            if self.density_weighting:
-                self.rho.append(float(rho[i]))
     def sample(self, batch_size):
         if len(self.x) == 0:
-            return None, None, None, None
+            return None
 
         idx = np.random.choice(
             len(self.x),
@@ -220,39 +164,17 @@ class FluxReplayBuffer:
             replace=False,
         )
 
-        x = torch.stack([
-            self.x[i] for i in idx
-        ])
+        x = torch.stack([self.x[i] for i in idx])
+        y = torch.tensor([self.y[i] for i in idx], dtype=torch.long)
+        z_ref = torch.stack([self.z_ref[i] for i in idx])
 
-        y = torch.tensor(
-            [self.y[i] for i in idx],
-            dtype=torch.long,
-        )
-
-        z_ref = torch.stack([
-            self.z_ref[i] for i in idx
-        ])
-
-        if self.density_weighting:
-
-            rho = torch.tensor(
-                [self.rho[i] for i in idx],
-                dtype=torch.float32,
-            )
-
-        else:
-
-            rho = None
-
-        return x, y, z_ref, rho
+        return x, y, z_ref
 
 
 def flux_loss(
         model,
         x,
         z_ref,
-        rho,
-        alpha,
         layer,
         normalize=True,
 ):
@@ -262,34 +184,20 @@ def flux_loss(
         z_now = F.normalize(z_now, dim=1)
         z_ref = F.normalize(z_ref, dim=1)
 
-    # Squared representation movement for each sample
-    displacement_sq = (
-            (z_now - z_ref) ** 2
-    ).sum(dim=1)
-
-    # Inverse-density weighting:
-    # sparse samples receive larger weights
-    if rho is None or alpha == 0.0:
-        return displacement_sq.mean()
-
-    weights = (rho + DENSITY_EPS).pow(-alpha)
-    weights = weights / (weights.mean() + DENSITY_EPS)
-
-    return (weights * displacement_sq).mean()
+    return ((z_now - z_ref) ** 2).sum(dim=1).mean()
 
 
 def train_task(
         model,
         dataset,
         replay_buffer,
-        use_flux_reg,
         lambda_flux,
-        alpha,
+        replay_weight,
+        seen_classes,
         batch_size,
         epochs,
         lr,
         optimizer_name,
-        replay_weight,
 ):
     loader = DataLoader(
         dataset,
@@ -298,23 +206,26 @@ def train_task(
     )
 
     if optimizer_name == "adam":
+
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=lr,
         )
 
     elif optimizer_name == "sgd":
+
         optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=lr,
-        momentum=0.9,
-        weight_decay=5e-4,
+            model.parameters(),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=5e-4,
         )
 
     else:
         raise ValueError(
             f"Unknown optimizer: {optimizer_name}"
         )
+
     scheduler = None
 
     if optimizer_name == "sgd":
@@ -329,69 +240,106 @@ def train_task(
     logs = []
 
     for epoch in range(epochs):
+
         running_loss = 0.0
         running_task = 0.0
-        running_replay = 0.0
+
+        running_replay_ce = 0.0
         running_flux = 0.0
         n_batches = 0
 
         for x, y in loader:
+
             x = x.to(DEVICE)
             y = y.to(DEVICE)
 
+            optimizer.zero_grad()
+
+            #
+            # Current task loss
+            #
             logits = model(x)
-            loss_task = criterion(logits, y)
+            mask = torch.zeros(
+                logits.size(1),
+                dtype=torch.bool,
+                device=DEVICE,
+            )
+
+            allowed = set(seen_classes)
+            allowed.update(torch.unique(y).tolist())
+
+            mask[list(allowed)] = True
+
+            masked_logits = logits.clone()
+            masked_logits[:, ~mask] = -1e9
+
+            loss_task = criterion(masked_logits, y)
+
             loss = loss_task
 
-            loss_replay = torch.tensor(0.0, device=DEVICE)
+            #
+            # Initialize logging variables
+            #
+
+            loss_replay_ce = torch.tensor(0.0, device=DEVICE)
             loss_flux = torch.tensor(0.0, device=DEVICE)
 
-            rx, ry, rz, rrho = replay_buffer.sample(2 * len(x))
+            #
+            # ER
+            #
+            sample = replay_buffer.sample(2 * len(x))
 
-            if rx is not None:
+            if sample is not None:
+
+                rx, ry, rz = sample
+
                 rx = rx.to(DEVICE)
                 ry = ry.to(DEVICE)
                 rz = rz.to(DEVICE)
 
 
-                loss_replay = criterion(model(rx), ry)
-                loss = loss + replay_weight * loss_replay
+                pred = model(rx)
 
-                if use_flux_reg:
-                    if rrho is not None:
-                        rrho = rrho.to(DEVICE)
+
+
+
+                loss_replay_ce = criterion(pred, ry)
+
+                loss = (
+                        loss
+                        + replay_weight * loss_replay_ce
+                )
+
+                #
+                # FlowLess regularizer
+                #
+                if lambda_flux > 0:
 
                     loss_flux = flux_loss(
                         model=model,
                         x=rx,
                         z_ref=rz,
-                        rho=rrho,
-                        alpha=(
-                            alpha
-                            if replay_buffer.density_weighting
-                            else 0.0
-                        ),
                         layer=replay_buffer.layer,
                     )
+
                     loss = loss + lambda_flux * loss_flux
 
-            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            running_loss += float(loss.item())
-            running_task += float(loss_task.item())
-            running_replay += float(loss_replay.item())
-            running_flux += float(loss_flux.item())
+            running_loss += loss.item()
+            running_task += loss_task.item()
+
+            running_replay_ce += loss_replay_ce.item()
+            running_flux += loss_flux.item()
             n_batches += 1
         if scheduler is not None:
             scheduler.step()
-
         logs.append({
             "epoch": epoch,
             "loss": running_loss / max(n_batches, 1),
             "task_loss": running_task / max(n_batches, 1),
-            "replay_loss": running_replay / max(n_batches, 1),
+            "replay_ce": running_replay_ce / max(n_batches, 1),
             "flux_loss": running_flux / max(n_batches, 1),
         })
 
@@ -443,14 +391,15 @@ def run_condition(
         memory_per_task,
         use_flux_reg,
         lambda_flux,
+        replay_weight,
         seed,
         out_dir,
-        density_weighting,
-        alpha,
 ):
     set_seed(seed)
 
-    cfg = get_experiment_config(dataset_name)
+    cfg = get_experiment_config(
+        dataset_name
+    )
 
     dataset = Dataset(dataset_name)
 
@@ -459,8 +408,9 @@ def run_condition(
     replay_buffer = FluxReplayBuffer(
         memory_per_task=memory_per_task,
         layer=cfg["layer"],
-        density_weighting=density_weighting,
     )
+
+    seen_classes = set()
 
     num_tasks = dataset.num_tasks()
     acc_matrix = np.zeros((num_tasks, num_tasks), dtype=np.float32)
@@ -469,12 +419,22 @@ def run_condition(
 
     for current_task in range(num_tasks):
         train_taskset, _ = dataset.get_task(current_task)
+        labels = [
+            train_taskset.dataset.targets[i]
+            for i in train_taskset.indices
+        ]
 
+        if torch.is_tensor(labels):
+            labels = labels.tolist()
+
+        seen_classes.update(int(c) for c in labels)
         print()
         print("=" * 70)
         print(
-            f"seed={seed} memory={memory_per_task} "
-            f"flux_reg={int(use_flux_reg)} task={current_task}"
+            f"seed={seed} "
+            f"memory={memory_per_task} "
+            f"lambda={lambda_flux:g} "
+            f"task={current_task}"
         )
         print("=" * 70)
 
@@ -482,14 +442,13 @@ def run_condition(
             model=model,
             dataset=train_taskset,
             replay_buffer=replay_buffer,
-            use_flux_reg=use_flux_reg,
             lambda_flux=lambda_flux,
-            alpha=alpha,
+            replay_weight=replay_weight,
+            seen_classes=seen_classes,
             batch_size=cfg["batch_size"],
             epochs=cfg["epochs"],
             lr=cfg["lr"],
             optimizer_name=cfg["optimizer"],
-            replay_weight=cfg["replay_weight"],
         )
 
         for row in logs:
@@ -499,16 +458,11 @@ def run_condition(
                 "use_flux_reg": int(use_flux_reg),
                 "task": current_task,
                 "lambda_flux": lambda_flux,
-                "alpha": alpha,
             })
 
         train_logs.extend(logs)
 
-
         replay_buffer.add_dataset(model, train_taskset)
-
-
-
 
         for eval_task in range(current_task + 1):
             _, test_taskset = dataset.get_task(eval_task)
@@ -525,9 +479,7 @@ def run_condition(
 
     tag = (
         f"seed{seed}_mem{memory_per_task}_"
-        f"flux{int(use_flux_reg)}_"
-        f"lambda{lambda_flux:g}_"
-        f"alpha{alpha:g}"
+        f"lambda{lambda_flux:g}"
     )
 
     np.save(out_dir / f"{tag}_acc_matrix.npy", acc_matrix)
@@ -536,16 +488,16 @@ def run_condition(
         json.dump(train_logs, f, indent=4)
 
     return {
+        "algorithm": ALGORITHM,
         "dataset": dataset_name,
         "model": model.__class__.__name__,
         "representation_layer": cfg["layer"],
         "epochs_per_task": cfg["epochs"],
         "batch_size": cfg["batch_size"],
+        "eval_batch_size": cfg["eval_batch_size"],
         "optimizer": cfg["optimizer"],
         "learning_rate": cfg["lr"],
         "seed": seed,
-        "density_weighting": int(density_weighting),
-        "alpha": alpha,
         "memory_per_task": memory_per_task,
         "use_flux_reg": int(use_flux_reg),
         "lambda_flux": lambda_flux,
@@ -554,6 +506,7 @@ def run_condition(
         "replay_size": len(replay_buffer),
     }
 
+
 def parse_int_list(text):
     return [int(x) for x in text.split(",") if x.strip()]
 
@@ -561,69 +514,53 @@ def parse_int_list(text):
 def main():
     parser = argparse.ArgumentParser()
 
+
     parser.add_argument(
-        "--density_weighting",
-        action="store_true",
-        help="Weight FlowLess by density.",
-    )
-    parser.add_argument(
-        "--memory_sizes",
-        type=str,
-        default="10,20,40,80,160",
+        "--memory_size",
+        type=int,
+        default=40,
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default="mnist",
     )
-
+    parser.add_argument(
+        "--lambda_grid",
+        type=str,
+        default="0,0.03,0.1,0.3,1.0",
+    )
     parser.add_argument(
         "--seeds",
         type=str,
-        default="0,1,2,3,4,5,6,7,8,9",
+        default="0,1,2,3,4",
+    )
+    parser.add_argument(
+        "--replay_weight",
+        type=float,
+        default=2.0,
     )
 
-    parser.add_argument(
-        "--lambda_flux",
-        type=float,
-        default=LAMBDA_FLUX,
-    )
 
     parser.add_argument(
         "--out",
         type=str,
         default=str(OUT),
     )
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=0.5,
-        help="Density weighting exponent.",
-    )
 
     args = parser.parse_args()
-
-    memory_sizes = parse_int_list(args.memory_sizes)
+    lambda_grid = [
+        float(x)
+        for x in args.lambda_grid.split(",")
+    ]
+    memory_size = args.memory_size
     seeds = parse_int_list(args.seeds)
-    memory_tag = (
-        "density_weighted"
-        if args.density_weighting
-        else "standard"
-    )
 
-    if args.density_weighting:
-        out_dir = (
-                Path(args.out)
-                / args.dataset
-                / memory_tag
-                / f"alpha_{args.alpha:g}"
-        )
-    else:
-        out_dir = (
+    out_dir = (
             Path(args.out)
             / args.dataset
-            / memory_tag
-        )
+            / "random"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
@@ -631,60 +568,65 @@ def main():
 
 
     for seed in seeds:
-        for memory_per_task in memory_sizes:
-            for lambda_flux in lambda_grid:
 
-                tag = (
-                    f"seed{seed}_mem{memory_per_task}_"
-                    f"flux{int(lambda_flux > 0)}_"
-                    f"lambda{lambda_flux:g}_"
-                    f"alpha{args.alpha:g}"
+        seed_results = []
+
+        for lambda_flux in lambda_grid:
+            tag = (
+                f"seed{seed}_mem{memory_size}_"
+                f"lambda{lambda_flux:g}"
+            )
+
+            acc_file = (
+                    out_dir
+                    / f"{tag}_acc_matrix.npy"
+            )
+
+            if acc_file.exists():
+
+                print(f"[SKIP] {tag}")
+
+                continue
+            result = run_condition(
+                dataset_name=args.dataset,
+                memory_per_task=memory_size,
+                use_flux_reg=(lambda_flux > 0),
+                lambda_flux=lambda_flux,
+                replay_weight=args.replay_weight,
+                seed=seed,
+                out_dir=out_dir,
+            )
+
+            results.append(result)
+            seed_results.append(result)
+            if args.dataset.lower() == "cifar10":
+
+                results_csv = (
+                        out_dir
+                        / f"results_seed{seed}.csv"
                 )
 
-                acc_file = out_dir / f"{tag}_acc_matrix.npy"
+            else:
 
-                if acc_file.exists():
-                    print(f"[SKIP] {tag}")
-                    continue
-
-                result = run_condition(
-                    dataset_name=args.dataset,
-                    memory_per_task=memory_per_task,
-                    use_flux_reg=(lambda_flux > 0),
-                    lambda_flux=lambda_flux,
-                    seed=seed,
-                    out_dir=out_dir,
-                    density_weighting=args.density_weighting,
-                    alpha=args.alpha,
+                results_csv = (
+                        out_dir
+                        / "results.csv"
                 )
 
-                results.append(result)
+            if args.dataset.lower() == "cifar10":
+                rows_to_write = seed_results
+            else:
+                rows_to_write = results
 
-                if args.dataset.lower() in {
-                    "cifar10",
-                    "tinyimagenet",
-                    "tiny_imagenet",
-                }:
-                    results_csv = out_dir / f"results_seed{seed}.csv"
-                else:
-                    results_csv = out_dir / "results.csv"
+            with open(results_csv, "w", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=list(rows_to_write[0].keys()),
+                )
+                writer.writeheader()
+                writer.writerows(rows_to_write)
 
-                results_csv = out_dir / f"results_seed{seed}.csv"
-
-                file_exists = results_csv.exists()
-
-                with open(results_csv, "a", newline="") as f:
-                    writer = csv.DictWriter(
-                        f,
-                        fieldnames=list(result.keys()),
-                    )
-
-                    if not file_exists:
-                        writer.writeheader()
-
-                    writer.writerow(result)
-
-                print(f"saved: {results_csv}")
+            print(f"saved: {results_csv}")
 
     print()
     print("=" * 70)

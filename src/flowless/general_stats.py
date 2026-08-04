@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
-
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import ttest_rel
 import pandas as pd
 
 
@@ -16,7 +17,37 @@ def main():
 
     args = parser.parse_args()
 
-    df = pd.read_csv(args.results)
+    from pathlib import Path
+
+    path = Path(args.results)
+
+    if path.is_file():
+        df = pd.read_csv(path)
+        out_dir = path.parent
+
+    elif path.is_dir():
+
+        csvs = sorted(path.glob("results_seed*.csv"))
+
+        if csvs:
+            df = pd.concat(
+                [pd.read_csv(f) for f in csvs],
+                ignore_index=True,
+            )
+        else:
+            single_file = path / "results.csv"
+
+            if not single_file.exists():
+                raise FileNotFoundError(
+                    f"Expected results_seed*.csv or results.csv in {path}"
+                )
+
+            df = pd.read_csv(single_file)
+
+        out_dir = path
+
+    else:
+        raise FileNotFoundError(path)
 
     #
     # Group columns
@@ -41,14 +72,93 @@ def main():
 
     summary = summary.fillna(0.0)
 
-    out_dir = Path(args.results).parent
 
-    summary.to_csv(
-        out_dir / "derpp_lambda_sweep_summary.csv",
-        index=False,
-        )
 
     #
+    # Paired p-values for every lambda vs baseline (lambda=0)
+    #
+    p_acc = []
+    p_forgetting = []
+
+    for _, row in summary.iterrows():
+
+        mem = row["memory_per_task"]
+        lam = row["lambda_flux"]
+
+        if lam == 0.0:
+            p_acc.append(float("nan"))
+            p_forgetting.append(float("nan"))
+            continue
+
+        base = (
+            df[
+                (df.memory_per_task == mem)
+                & (df.lambda_flux == 0.0)
+                ]
+            .sort_values("seed")
+        )
+
+        flow = (
+            df[
+                (df.memory_per_task == mem)
+                & (df.lambda_flux == lam)
+                ]
+            .sort_values("seed")
+        )
+
+        merged = base.merge(
+            flow,
+            on="seed",
+            suffixes=("_base", "_flow"),
+        )
+        # Not enough paired observations for a paired t-test
+        if merged["seed"].nunique() < 2:
+            p_acc.append(float("nan"))
+            p_forgetting.append(float("nan"))
+            continue
+        _, p1 = ttest_rel(
+            merged.final_avg_acc_flow,
+            merged.final_avg_acc_base,
+        )
+
+        _, p2 = ttest_rel(
+            merged.mean_forgetting_flow,
+            merged.mean_forgetting_base,
+        )
+
+        p_acc.append(p1)
+        p_forgetting.append(p2)
+
+    summary["p_acc"] = p_acc
+    summary["p_forgetting"] = p_forgetting
+    #
+    # Multiple-comparison correction (Holm-Bonferroni)
+    #
+
+    #
+    # Multiple-comparison correction (Holm-Bonferroni)
+    #
+
+    summary["p_acc_holm"] = float("nan")
+    summary["p_forgetting_holm"] = float("nan")
+
+    mask = summary["p_acc"].notna()
+
+    if mask.any():
+        summary.loc[mask, "p_acc_holm"] = multipletests(
+            summary.loc[mask, "p_acc"],
+            method="holm",
+        )[1]
+
+    mask = summary["p_forgetting"].notna()
+
+    if mask.any():
+        summary.loc[mask, "p_forgetting_holm"] = multipletests(
+            summary.loc[mask, "p_forgetting"],
+            method="holm",
+        )[1]
+
+#
     # Best accuracy
     #
     best_acc = (
@@ -66,7 +176,6 @@ def main():
         out_dir / "derpp_best_lambda_by_accuracy.csv",
         index=False,
         )
-
     #
     # Best forgetting
     #

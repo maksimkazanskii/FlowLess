@@ -616,7 +616,14 @@ def plot_smoothed_effect(
 
     legend.get_frame().set_linewidth(0.5)
 
-    plt.grid(False)
+    ax.grid(
+        True,
+        color="#b0b0b0",
+        alpha=0.35,
+        linewidth=0.8,
+    )
+
+    ax.set_axisbelow(True)
     plt.tight_layout(pad=0.1)
 
     if filename is None:
@@ -804,7 +811,7 @@ def plot_probe_summary(summary, probe):
                 color="gray",
                 linestyle="--",
                 linewidth=1.0,
-                alpha=0.35,
+                alpha=0.6,
             )
 
         ax.grid(alpha=0.25)

@@ -16,6 +16,7 @@ from src.datasets.datasets import Dataset
 from sklearn.neighbors import NearestNeighbors
 from src.models.resnet import ResNet18
 
+import time
 def get_experiment_config(dataset_name):
 
     dataset_name = dataset_name.lower()
@@ -24,12 +25,12 @@ def get_experiment_config(dataset_name):
         return {
             "model_factory": lambda: ResNet18(num_classes=200),
             "layer": "layer4",
-            "epochs": 80,
-            "batch_size": 128,
-            "eval_batch_size": 256,
+            "epochs": 40,
+            "batch_size": 256,
+            "eval_batch_size": 512,
             "lr": 0.1,
             "optimizer": "sgd",
-            "replay_weight": 10.0,
+            "replay_weight": 2.0,
         }
 
     if dataset_name == "mnist":
@@ -60,7 +61,7 @@ def get_experiment_config(dataset_name):
         return {
             "model_factory": lambda: ResNet18(num_classes=10),
             "layer": "layer4",
-            "epochs": 15,
+            "epochs": 40,
             "batch_size": 128,
             "eval_batch_size": 256,
             "lr": 0.1,
@@ -90,12 +91,18 @@ def compute_density(Z, k=10):
 OUT = Path("data/results/flowless")
 
 DEVICE = (
-    "cuda"
+    torch.device("cuda")
     if torch.cuda.is_available()
-    else "mps"
+    else torch.device("mps")
     if torch.backends.mps.is_available()
-    else "cpu"
+    else torch.device("cpu")
 )
+
+print(f"Using device: {DEVICE}")
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 #DEVICE = "cpu"
 
 REPLAY_WEIGHT = 2.0
@@ -163,21 +170,35 @@ class FluxReplayBuffer:
             # --------------------------------------------------
             features = []
 
-            for i in range(len(dataset)):
-                x, _ = dataset[i]
+            loader = DataLoader(
+                dataset,
+                batch_size=512,
+                shuffle=False,
+                num_workers=2,
+                pin_memory=True,
+                persistent_workers=True,
+            )
 
-                xb = x.unsqueeze(0).to(DEVICE)
+            features = []
 
-                z = model.features(xb)[self.layer]
-                z = F.normalize(z, dim=1)
+            with torch.no_grad():
 
-                features.append(
-                    z.squeeze(0).cpu().numpy()
-                )
+                for x,_ in loader:
 
-            features = np.stack(features)
+                    x = x.to(
+                        DEVICE,
+                        non_blocking=True,
+                    )
 
-            # Density of every sample in the current task
+                    z = model.features(x)[self.layer]
+                    z = F.normalize(z, dim=1)
+
+                    features.append(
+                        z.cpu()
+                    )
+
+            features = torch.cat(features).numpy()
+
             rho = compute_density(features)
 
         # --------------------------------------------------
@@ -192,24 +213,20 @@ class FluxReplayBuffer:
         # --------------------------------------------------
         # Store samples, reference features, and densities
         # --------------------------------------------------
-        for i in idx:
-            x, y = dataset[i]
+        xs = torch.stack([dataset[i][0] for i in idx]).to(DEVICE)
+        ys = [dataset[i][1] for i in idx]
 
-            xb = x.unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            z_refs = model.features(xs)[self.layer].cpu()
 
-            z_ref = (
-                model.features(xb)[self.layer]
-                .squeeze(0)
-                .detach()
-                .cpu()
-            )
+        for sample_idx, x, y, z_ref in zip(idx, xs.cpu(), ys, z_refs):
 
             self.x.append(x.clone())
             self.y.append(int(y))
             self.z_ref.append(z_ref.clone())
 
             if self.density_weighting:
-                self.rho.append(float(rho[i]))
+                self.rho.append(float(rho[sample_idx]))
     def sample(self, batch_size):
         if len(self.x) == 0:
             return None, None, None, None
@@ -295,6 +312,10 @@ def train_task(
         dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=2 if DEVICE.type == "cuda" else 0,
+        pin_memory=(DEVICE.type == "cuda"),
+        persistent_workers=(DEVICE.type == "cuda"),
+        prefetch_factor=2 if DEVICE.type == "cuda" else None,
     )
 
     if optimizer_name == "adam":
@@ -315,12 +336,32 @@ def train_task(
         raise ValueError(
             f"Unknown optimizer: {optimizer_name}"
         )
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=(DEVICE.type == "cuda"),
+    )
     scheduler = None
 
     if optimizer_name == "sgd":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+
+        warmup_epochs = 5
+
+        warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            T_max=epochs,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs - warmup_epochs,
+        )
+
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
         )
     criterion = nn.CrossEntropyLoss()
 
@@ -329,6 +370,11 @@ def train_task(
     logs = []
 
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
+
+        running_correct = 0
+        running_total = 0
+
         running_loss = 0.0
         running_task = 0.0
         running_replay = 0.0
@@ -336,64 +382,123 @@ def train_task(
         n_batches = 0
 
         for x, y in loader:
-            x = x.to(DEVICE)
-            y = y.to(DEVICE)
-
-            logits = model(x)
-            loss_task = criterion(logits, y)
-            loss = loss_task
-
-            loss_replay = torch.tensor(0.0, device=DEVICE)
-            loss_flux = torch.tensor(0.0, device=DEVICE)
+            x = x.to(
+                DEVICE,
+                non_blocking=(DEVICE.type == "cuda"),
+            )
+            y = y.to(
+                DEVICE,
+                non_blocking=(DEVICE.type == "cuda"),
+            )
 
             rx, ry, rz, rrho = replay_buffer.sample(2 * len(x))
 
             if rx is not None:
-                rx = rx.to(DEVICE)
-                ry = ry.to(DEVICE)
-                rz = rz.to(DEVICE)
+                rx = rx.to(
+                    DEVICE,
+                    non_blocking=(DEVICE.type == "cuda"),
+                )
+                ry = ry.to(
+                    DEVICE,
+                    non_blocking=(DEVICE.type == "cuda"),
+                )
+                rz = rz.to(
+                    DEVICE,
+                    non_blocking=(DEVICE.type == "cuda"),
+                )
 
-
-                loss_replay = criterion(model(rx), ry)
-                loss = loss + replay_weight * loss_replay
-
-                if use_flux_reg:
-                    if rrho is not None:
-                        rrho = rrho.to(DEVICE)
-
-                    loss_flux = flux_loss(
-                        model=model,
-                        x=rx,
-                        z_ref=rz,
-                        rho=rrho,
-                        alpha=(
-                            alpha
-                            if replay_buffer.density_weighting
-                            else 0.0
-                        ),
-                        layer=replay_buffer.layer,
+                if rrho is not None:
+                    rrho = rrho.to(
+                        DEVICE,
+                        non_blocking=(DEVICE.type == "cuda"),
                     )
-                    loss = loss + lambda_flux * loss_flux
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-            running_loss += float(loss.item())
-            running_task += float(loss_task.item())
-            running_replay += float(loss_replay.item())
-            running_flux += float(loss_flux.item())
+            with torch.amp.autocast(
+                    device_type="cuda",
+                    enabled=(DEVICE.type == "cuda"),
+            ):
+                logits = model(x)
+
+                loss_task = criterion(logits, y)
+                loss = loss_task
+                pred = logits.argmax(dim=1)
+                running_correct += (pred == y).sum().item()
+                running_total += y.size(0)
+
+                loss_replay = torch.zeros(
+                    (),
+                    device=DEVICE,
+                )
+                loss_flux = torch.zeros(
+                    (),
+                    device=DEVICE,
+                )
+
+                if rx is not None:
+                    replay_logits = model(rx)
+
+                    loss_replay = criterion(
+                        replay_logits,
+                        ry,
+                    )
+
+                    loss = (
+                            loss
+                            + replay_weight * loss_replay
+                    )
+
+                    if use_flux_reg:
+                        loss_flux = flux_loss(
+                            model=model,
+                            x=rx,
+                            z_ref=rz,
+                            rho=rrho,
+                            alpha=(
+                                alpha
+                                if replay_buffer.density_weighting
+                                else 0.0
+                            ),
+                            layer=replay_buffer.layer,
+                        )
+
+                        loss = (
+                                loss
+                                + lambda_flux * loss_flux
+                        )
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += float(loss.detach().item())
+            running_task += float(loss_task.detach().item())
+            running_replay += float(loss_replay.detach().item())
+            running_flux += float(loss_flux.detach().item())
             n_batches += 1
+
         if scheduler is not None:
             scheduler.step()
+        epoch_time = time.perf_counter() - epoch_start
 
         logs.append({
             "epoch": epoch,
+            "epoch_time": epoch_time,
             "loss": running_loss / max(n_batches, 1),
             "task_loss": running_task / max(n_batches, 1),
             "replay_loss": running_replay / max(n_batches, 1),
             "flux_loss": running_flux / max(n_batches, 1),
         })
+        epoch_acc = 100.0 * running_correct / max(running_total, 1)
+        print(
+            f"Epoch {epoch + 1:3d}/{epochs} | "
+            f"Time: {epoch_time:.1f}s | "
+            f"Acc: {epoch_acc:.2f}% | "
+            f"Loss: {running_loss / max(n_batches, 1):.4f} | "
+            f"Task: {running_task / max(n_batches, 1):.4f} | "
+            f"Replay: {running_replay / max(n_batches, 1):.4f} | "
+            f"Flux: {running_flux / max(n_batches, 1):.4f}"
+        )
 
     return logs
 
@@ -408,6 +513,10 @@ def evaluate(
         dataset,
         batch_size=batch_size,
         shuffle=False,
+        num_workers=2 if DEVICE.type == "cuda" else 0,
+        pin_memory=(DEVICE.type == "cuda"),
+        persistent_workers=(DEVICE.type == "cuda"),
+        prefetch_factor=2 if DEVICE.type == "cuda" else None,
     )
 
     model.eval()
@@ -455,7 +564,8 @@ def run_condition(
     dataset = Dataset(dataset_name)
 
     model = cfg["model_factory"]().to(DEVICE)
-
+    #if DEVICE.type == "cuda":
+    #    model = torch.compile(model)
     replay_buffer = FluxReplayBuffer(
         memory_per_task=memory_per_task,
         layer=cfg["layer"],
@@ -669,17 +779,16 @@ def main():
                 else:
                     results_csv = out_dir / "results.csv"
 
-                results_csv = out_dir / f"results_seed{seed}.csv"
-
-                file_exists = results_csv.exists()
+                write_header = not results_csv.exists()
 
                 with open(results_csv, "a", newline="") as f:
+
                     writer = csv.DictWriter(
                         f,
                         fieldnames=list(result.keys()),
                     )
 
-                    if not file_exists:
+                    if write_header:
                         writer.writeheader()
 
                     writer.writerow(result)

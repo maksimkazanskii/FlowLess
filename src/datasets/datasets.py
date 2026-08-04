@@ -1,7 +1,7 @@
 from .split_mnist import SplitMNIST
 from .split_fashion_mnist import SplitFashionMNIST
 from .split_cifar10 import SplitCIFAR10
-
+from .split_tiny_imagenet import SplitTinyImageNet
 
 class Dataset:
     def __init__(self, name):
@@ -12,6 +12,8 @@ class Dataset:
             self.dataset = SplitFashionMNIST()
         elif name in ["cifar", "cifar10"]:
             self.dataset = SplitCIFAR10()
+        elif name in {"tinyimagenet", "tiny_imagenet"}:
+            self.dataset = SplitTinyImageNet()
         else:
             raise ValueError(name)
 
