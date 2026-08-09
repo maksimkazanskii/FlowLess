@@ -305,10 +305,10 @@ def train_task(
 
     elif optimizer_name == "sgd":
         optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=lr,
-        momentum=0.9,
-        weight_decay=5e-4,
+            model.parameters(),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=5e-4,
         )
 
     else:
@@ -620,9 +620,9 @@ def main():
         )
     else:
         out_dir = (
-            Path(args.out)
-            / args.dataset
-            / memory_tag
+                Path(args.out)
+                / args.dataset
+                / memory_tag
         )
     out_dir.mkdir(parents=True, exist_ok=True)
 

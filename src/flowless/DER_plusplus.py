@@ -9,13 +9,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torchvision import datasets, transforms
+from torchvision.models import resnet18
+from torch.utils.data import Subset
 from src.models.mlp import MLP
 from src.datasets.datasets import Dataset
 
 ALGORITHM = "DER++"
 OUT = Path("data/results/flowless_derpp")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
 BATCH_SIZE = 256
 EPOCHS = 5
 LR = 1e-3
@@ -125,7 +134,8 @@ def train_task(
         dataset,
         replay_buffer,
         lambda_flux,
-        der_replay_weight,
+        der_alpha,
+        der_beta,
 ):
     loader = DataLoader(
         dataset,
@@ -195,13 +205,12 @@ def train_task(
                 # DER++ replay objective
                 #
                 loss_mse = F.mse_loss(pred, rlogits)
-
                 loss_replay_ce = criterion(pred, ry)
 
                 loss = (
                         loss
-                        + loss_mse
-                        + der_replay_weight * loss_replay_ce
+                        + der_alpha * loss_mse
+                        + der_beta * loss_replay_ce
                 )
 
                 #
@@ -280,7 +289,8 @@ def run_condition(
         memory_per_task,
         use_flux_reg,
         lambda_flux,
-        der_replay_weight,
+        der_alpha,
+        der_beta,
         seed,
         out_dir,
 ):
@@ -312,7 +322,8 @@ def run_condition(
             dataset=train_taskset,
             replay_buffer=replay_buffer,
             lambda_flux=lambda_flux,
-            der_replay_weight=der_replay_weight,
+            der_alpha=der_alpha,
+            der_beta=der_beta,
         )
 
         for row in logs:
@@ -381,7 +392,7 @@ def main():
     parser.add_argument(
         "--lambda_grid",
         type=str,
-        default="0,0.03,0.1,0.3,1.0",
+        default="0,0.1,0.3,1.0,3.0",
     )
     parser.add_argument(
         "--seeds",
@@ -389,7 +400,13 @@ def main():
         default="0,1,2,3,4",
     )
     parser.add_argument(
-        "--der_replay_weight",
+        "--der_alpha",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--der_beta",
         type=float,
         default=2.0,
     )
@@ -430,22 +447,28 @@ def main():
                 memory_per_task=memory_size,
                 use_flux_reg=(lambda_flux > 0),
                 lambda_flux=lambda_flux,
-                der_replay_weight=args.der_replay_weight,
+                der_alpha=args.der_alpha,
+                der_beta=args.der_beta,
                 seed=seed,
                 out_dir=out_dir,
             )
 
             results.append(result)
 
-            results_csv = out_dir / "results.csv"
 
-            with open(results_csv, "w", newline="") as f:
+            results_csv = out_dir / f"results_seed{seed}.csv"
+            file_exists = results_csv.exists()
+
+            with open(results_csv, "a", newline="") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=list(results[0].keys()),
+                    fieldnames=list(result.keys()),
                 )
-                writer.writeheader()
-                writer.writerows(results)
+
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerow(result)
 
             print(f"saved: {results_csv}")
 

@@ -27,7 +27,7 @@ The repository contains experiments on
 - SplitFashionMNIST
 - SplitCIFAR10
 - SplitTinyImageNet
-- 
+
 ## Project Workflow
 
 The repository is organized around a simple pipeline: benchmark datasets are loaded, neural network models are trained using the FlowLess-R continual learning algorithms, and the resulting checkpoints and logs are analyzed to generate the figures and statistics reported in the paper.
@@ -71,13 +71,14 @@ The repository is organized around a simple pipeline: benchmark datasets are loa
                            │       Tables             │
                            │      Final Results       │
                            └───────────────────────────┘
+```
 
 # Quick Start
 
 ## Clone the repository
 
 ```bash
-git clone https://github.com/<your-username>/FlowLess-R.git
+git clone https://github.com/maksimkazanskii/FlowLess-R.git
 cd FlowLess-R
 ```
 
@@ -194,7 +195,7 @@ This package contains the neural network architectures used throughout the conti
 
 ## src/flowless
 
-Main implementation of FlowLess-R.
+This package contains the complete implementation of FlowLess-R, including replay-based continual learning algorithms, hyperparameter sweeps, statistical analyses, and utilities used to reproduce the experiments reported in the paper.
 
 ### Training
 
@@ -221,7 +222,7 @@ Main implementation of FlowLess-R.
 
 ## src/investigation
 
-Scripts used to produce the analyses in the paper.
+This package contains the scripts used to analyze representation dynamics and generate the figures presented in the paper, including representation flux, representation density, confidence evolution, and forgetting analyses.
 
 | File | Description |
 |------|-------------|
@@ -234,33 +235,7 @@ Scripts used to produce the analyses in the paper.
 
 ---
 
-# Running Experiments
 
-## Main FlowLess-R experiments
-
-```bash
-python -m src.flowless.regularizer_grid
-```
-
-## TinyImageNet
-
-```bash
-python -m src.flowless.regularizer_grid_tiny
-```
-
-## Representation geometry
-
-```bash
-python -m src.investigation.forgetting_flux
-```
-
-## Statistical analysis
-
-```bash
-python -m src.flowless.general_stats
-```
-
----
 
 ## Reproducibility
 
@@ -279,8 +254,25 @@ Unless otherwise specified, all reported results in the paper are presented as t
 
 **Geometry of Forgetting: Representation Flux in Continual Learning**
 
-This repository accompanies the paper introducing:
+This repository accompanies the paper and provides
 
+- the complete implementation of FlowLess-R,
+- scripts to reproduce all experiments,
+- representation geometry analyses,
+- statistical evaluation,
+- generation of all figures and tables reported in the paper.
 ## License
 
 This project is released under the MIT License.
+
+## Citation
+
+If you find this repository useful, please cite
+
+```bibtex
+@article{kazanskii2026flowless,
+  title={Geometry of Forgetting: Representation Flux in Continual Learning},
+  author={Kazanskii, Maksim A.},
+  year={2026}
+}
+```

@@ -7,7 +7,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--root",
     type=Path,
-    default=Path("data/results/investigation/mnist"),
+    default=Path("data/results/investigation/tinyimagenet"),
 )
 
 args = parser.parse_args()

@@ -26,7 +26,7 @@ def get_experiment_config(dataset_name):
             "model_factory": lambda: ResNet18(num_classes=200),
             "layer": "layer4",
             "epochs": 40,
-            "batch_size": 256,
+            "batch_size": 512,
             "eval_batch_size": 512,
             "lr": 0.1,
             "optimizer": "sgd",
@@ -174,9 +174,8 @@ class FluxReplayBuffer:
                 dataset,
                 batch_size=512,
                 shuffle=False,
-                num_workers=2,
-                pin_memory=True,
-                persistent_workers=True,
+                num_workers=0,
+                pin_memory=False,
             )
 
             features = []
@@ -308,15 +307,17 @@ def train_task(
         optimizer_name,
         replay_weight,
 ):
+    print("[T1] Creating DataLoader", flush=True)
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=2 if DEVICE.type == "cuda" else 0,
-        pin_memory=(DEVICE.type == "cuda"),
-        persistent_workers=(DEVICE.type == "cuda"),
-        prefetch_factor=2 if DEVICE.type == "cuda" else None,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
     )
+
+    print("[T2] DataLoader created", flush=True)
 
     if optimizer_name == "adam":
         optimizer = torch.optim.Adam(
@@ -326,24 +327,29 @@ def train_task(
 
     elif optimizer_name == "sgd":
         optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=lr,
-        momentum=0.9,
-        weight_decay=5e-4,
+            model.parameters(),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=5e-4,
         )
 
     else:
         raise ValueError(
             f"Unknown optimizer: {optimizer_name}"
         )
+
+    print("[T3] Optimizer created", flush=True)
+
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=(DEVICE.type == "cuda"),
     )
+
+    print("[T4] GradScaler created", flush=True)
+
     scheduler = None
 
     if optimizer_name == "sgd":
-
         warmup_epochs = 5
 
         warmup = torch.optim.lr_scheduler.LinearLR(
@@ -363,11 +369,17 @@ def train_task(
             schedulers=[warmup, cosine],
             milestones=[warmup_epochs],
         )
-    criterion = nn.CrossEntropyLoss()
 
+    print("[T5] Scheduler created", flush=True)
+
+    criterion = nn.CrossEntropyLoss()
     model.train()
 
     logs = []
+
+    print("[T6] Creating loader iterator", flush=True)
+    loader_iterator = iter(loader)
+    print("[T7] Loader iterator created", flush=True)
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
@@ -381,39 +393,50 @@ def train_task(
         running_flux = 0.0
         n_batches = 0
 
-        for x, y in loader:
-            x = x.to(
-                DEVICE,
-                non_blocking=(DEVICE.type == "cuda"),
-            )
-            y = y.to(
-                DEVICE,
-                non_blocking=(DEVICE.type == "cuda"),
-            )
+        print(
+            f"[T8] Starting epoch {epoch + 1}/{epochs}",
+            flush=True,
+        )
 
-            rx, ry, rz, rrho = replay_buffer.sample(2 * len(x))
+        for batch_idx, (x, y) in enumerate(loader):
+
+            if batch_idx == 0:
+                print(
+                    "[T9] First batch loaded:",
+                    x.shape,
+                    y.shape,
+                    x.dtype,
+                    flush=True,
+                )
+
+            x = x.to(DEVICE)
+            y = y.to(DEVICE)
+
+            if batch_idx == 0:
+                print(
+                    "[T10] First batch moved to GPU",
+                    flush=True,
+                )
+
+            rx, ry, rz, rrho = replay_buffer.sample(
+                2 * len(x)
+            )
 
             if rx is not None:
-                rx = rx.to(
-                    DEVICE,
-                    non_blocking=(DEVICE.type == "cuda"),
-                )
-                ry = ry.to(
-                    DEVICE,
-                    non_blocking=(DEVICE.type == "cuda"),
-                )
-                rz = rz.to(
-                    DEVICE,
-                    non_blocking=(DEVICE.type == "cuda"),
-                )
+                rx = rx.to(DEVICE)
+                ry = ry.to(DEVICE)
+                rz = rz.to(DEVICE)
 
                 if rrho is not None:
-                    rrho = rrho.to(
-                        DEVICE,
-                        non_blocking=(DEVICE.type == "cuda"),
-                    )
+                    rrho = rrho.to(DEVICE)
 
             optimizer.zero_grad(set_to_none=True)
+
+            if batch_idx == 0:
+                print(
+                    "[T11] Starting forward pass",
+                    flush=True,
+                )
 
             with torch.amp.autocast(
                     device_type="cuda",
@@ -421,16 +444,29 @@ def train_task(
             ):
                 logits = model(x)
 
+                if batch_idx == 0:
+                    print(
+                        "[T12] Forward pass completed:",
+                        logits.shape,
+                        flush=True,
+                    )
+
                 loss_task = criterion(logits, y)
                 loss = loss_task
+
                 pred = logits.argmax(dim=1)
-                running_correct += (pred == y).sum().item()
+
+                running_correct += (
+                        pred == y
+                ).sum().item()
+
                 running_total += y.size(0)
 
                 loss_replay = torch.zeros(
                     (),
                     device=DEVICE,
                 )
+
                 loss_flux = torch.zeros(
                     (),
                     device=DEVICE,
@@ -468,18 +504,65 @@ def train_task(
                                 + lambda_flux * loss_flux
                         )
 
+            if batch_idx == 0:
+                print(
+                    "[T13] Loss computed:",
+                    float(loss.detach().cpu()),
+                    flush=True,
+                )
+                print(
+                    "[T14] Starting backward pass",
+                    flush=True,
+                )
+
             scaler.scale(loss).backward()
+
+            if batch_idx == 0:
+                print(
+                    "[T15] Backward pass completed",
+                    flush=True,
+                )
+
             scaler.step(optimizer)
             scaler.update()
-            running_loss += float(loss.detach().item())
-            running_task += float(loss_task.detach().item())
-            running_replay += float(loss_replay.detach().item())
-            running_flux += float(loss_flux.detach().item())
+
+            if batch_idx == 0:
+                print(
+                    "[T16] Optimizer step completed",
+                    flush=True,
+                )
+
+            running_loss += float(
+                loss.detach().item()
+            )
+
+            running_task += float(
+                loss_task.detach().item()
+            )
+
+            running_replay += float(
+                loss_replay.detach().item()
+            )
+
+            running_flux += float(
+                loss_flux.detach().item()
+            )
+
             n_batches += 1
+
+            if batch_idx % 10 == 0:
+                print(
+                    f"[PROGRESS] epoch={epoch + 1} "
+                    f"batch={batch_idx}/{len(loader)}",
+                    flush=True,
+                )
 
         if scheduler is not None:
             scheduler.step()
-        epoch_time = time.perf_counter() - epoch_start
+
+        epoch_time = (
+                time.perf_counter() - epoch_start
+        )
 
         logs.append({
             "epoch": epoch,
@@ -489,15 +572,26 @@ def train_task(
             "replay_loss": running_replay / max(n_batches, 1),
             "flux_loss": running_flux / max(n_batches, 1),
         })
-        epoch_acc = 100.0 * running_correct / max(running_total, 1)
+
+        epoch_acc = (
+                100.0
+                * running_correct
+                / max(running_total, 1)
+        )
+
         print(
             f"Epoch {epoch + 1:3d}/{epochs} | "
             f"Time: {epoch_time:.1f}s | "
             f"Acc: {epoch_acc:.2f}% | "
-            f"Loss: {running_loss / max(n_batches, 1):.4f} | "
-            f"Task: {running_task / max(n_batches, 1):.4f} | "
-            f"Replay: {running_replay / max(n_batches, 1):.4f} | "
-            f"Flux: {running_flux / max(n_batches, 1):.4f}"
+            f"Loss: "
+            f"{running_loss / max(n_batches, 1):.4f} | "
+            f"Task: "
+            f"{running_task / max(n_batches, 1):.4f} | "
+            f"Replay: "
+            f"{running_replay / max(n_batches, 1):.4f} | "
+            f"Flux: "
+            f"{running_flux / max(n_batches, 1):.4f}",
+            flush=True,
         )
 
     return logs
@@ -513,10 +607,8 @@ def evaluate(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2 if DEVICE.type == "cuda" else 0,
-        pin_memory=(DEVICE.type == "cuda"),
-        persistent_workers=(DEVICE.type == "cuda"),
-        prefetch_factor=2 if DEVICE.type == "cuda" else None,
+        num_workers=0,
+        pin_memory=False,
     )
 
     model.eval()
@@ -559,34 +651,49 @@ def run_condition(
 ):
     set_seed(seed)
 
+    print("[1] Loading config")
     cfg = get_experiment_config(dataset_name)
 
+    print("[2] Creating Dataset")
     dataset = Dataset(dataset_name)
+    print("[3] Dataset created")
 
+    print("[4] Creating model")
     model = cfg["model_factory"]().to(DEVICE)
-    #if DEVICE.type == "cuda":
-    #    model = torch.compile(model)
+    print("[5] Model created")
+
+    print("[6] Creating replay buffer")
     replay_buffer = FluxReplayBuffer(
         memory_per_task=memory_per_task,
         layer=cfg["layer"],
         density_weighting=density_weighting,
     )
+    print("[7] Replay buffer created")
 
+    print("[8] Number of tasks")
     num_tasks = dataset.num_tasks()
-    acc_matrix = np.zeros((num_tasks, num_tasks), dtype=np.float32)
+    print("num_tasks =", num_tasks)
 
+    acc_matrix = np.zeros((num_tasks, num_tasks), dtype=np.float32)
     train_logs = []
 
     for current_task in range(num_tasks):
-        train_taskset, _ = dataset.get_task(current_task)
 
-        print()
-        print("=" * 70)
-        print(
-            f"seed={seed} memory={memory_per_task} "
-            f"flux_reg={int(use_flux_reg)} task={current_task}"
-        )
-        print("=" * 70)
+        print(f"\n===== TASK {current_task} =====")
+
+        print("[9] Calling dataset.get_task()")
+        train_taskset, _ = dataset.get_task(current_task)
+        print("[10] get_task() finished")
+
+        print("[11] Dataset length")
+        print(len(train_taskset))
+
+        print("[12] Reading first sample")
+        x0, y0 = train_taskset[0]
+        print("[13] First sample OK")
+        print(type(x0), y0)
+
+        print("[14] Starting training")
 
         logs = train_task(
             model=model,
@@ -602,6 +709,8 @@ def run_condition(
             replay_weight=cfg["replay_weight"],
         )
 
+        print("[15] Training finished")
+
         for row in logs:
             row.update({
                 "seed": seed,
@@ -614,21 +723,26 @@ def run_condition(
 
         train_logs.extend(logs)
 
-
+        print("[16] Adding replay dataset")
         replay_buffer.add_dataset(model, train_taskset)
-
-
-
+        print("[17] Replay added")
 
         for eval_task in range(current_task + 1):
+            print(f"[18] Evaluating task {eval_task}")
+
             _, test_taskset = dataset.get_task(eval_task)
+
             acc = evaluate(
                 model=model,
                 dataset=test_taskset,
                 batch_size=cfg["eval_batch_size"],
             )
+
             acc_matrix[current_task, eval_task] = acc
-            print(f"eval task {eval_task}: {acc:.2f}")
+
+            print(f"[19] Accuracy = {acc:.2f}")
+
+    print("[20] Computing summary")
 
     final_avg_acc = float(acc_matrix[-1].mean())
     mean_forgetting = forgetting_score(acc_matrix)
@@ -644,6 +758,8 @@ def run_condition(
 
     with open(out_dir / f"{tag}_train_logs.json", "w") as f:
         json.dump(train_logs, f, indent=4)
+
+    print("[21] Finished successfully")
 
     return {
         "dataset": dataset_name,

@@ -3,12 +3,15 @@ import csv
 import json
 import random
 from pathlib import Path
+import time
+import gc
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import pandas as pd
 
 from src.models.mlp import MLP
 from src.datasets.datasets import Dataset
@@ -16,7 +19,21 @@ from src.models.resnet import ResNet18
 
 ALGORITHM = "DER++"
 OUT = Path("data/results/flowless_derpp")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
+def cleanup_memory():
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 def get_experiment_config(dataset_name):
 
     dataset_name = dataset_name.lower()
@@ -30,7 +47,8 @@ def get_experiment_config(dataset_name):
             "eval_batch_size": 512,
             "lr": 1e-3,
             "optimizer": "adam",
-            "der_replay_weight": 2.0,
+            "der_alpha": der_alpha,
+            "der_beta": der_beta,
         }
 
     if dataset_name in {
@@ -45,19 +63,21 @@ def get_experiment_config(dataset_name):
             "eval_batch_size": 512,
             "lr": 1e-3,
             "optimizer": "adam",
-            "der_replay_weight": 2.0,
+            "der_alpha": der_alpha,
+            "der_beta": der_beta,
         }
 
     if dataset_name == "cifar10":
         return {
             "model_factory": lambda: ResNet18(num_classes=10),
             "layer": "layer4",
-            "epochs": 40,
+            "epochs": 15,
             "batch_size": 128,
             "eval_batch_size": 256,
             "lr": 0.1,
             "optimizer": "sgd",
-            "der_replay_weight": 2.0,
+            "der_alpha": 0.1,
+            "der_beta": 2.0,
         }
 
     raise ValueError(f"Unsupported dataset: {dataset_name}")
@@ -128,6 +148,12 @@ class FluxReplayBuffer:
                 .detach()
                 .cpu()
             )
+            print(
+                logits.min().item(),
+                logits.max().item(),
+                logits.norm().item()
+            )
+            assert torch.isfinite(logits).all(), "Stored logits contain NaN!"
 
             self.x.append(x.clone())
             self.y.append(int(y))
@@ -167,7 +193,8 @@ def train_task(
         dataset,
         replay_buffer,
         lambda_flux,
-        der_replay_weight,
+        der_alpha,
+        der_beta,
         batch_size,
         epochs,
         lr,
@@ -177,6 +204,8 @@ def train_task(
         dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=2,
+        persistent_workers=True,
     )
 
     if optimizer_name == "adam":
@@ -210,8 +239,10 @@ def train_task(
 
     logs = []
 
-    for epoch in range(epochs):
+    total_start = time.time()
 
+    for epoch in range(epochs):
+        epoch_start = time.time()
         running_loss = 0.0
         running_task = 0.0
         running_mse = 0.0
@@ -249,14 +280,18 @@ def train_task(
             if sample is not None:
 
                 rx, ry, rz, rlogits = sample
-
+                #print(torch.isnan(rlogits).any())
+                #print(torch.isnan(rx).any())
+                #print(torch.isnan(ry.float()).any())
                 rx = rx.to(DEVICE)
                 ry = ry.to(DEVICE)
                 rz = rz.to(DEVICE)
                 rlogits = rlogits.to(DEVICE)
 
                 pred = model(rx)
-
+                if not torch.isfinite(pred).all():
+                    print("NaN in replay prediction")
+                    raise RuntimeError
                 #
                 # DER++ replay objective
                 #
@@ -265,9 +300,9 @@ def train_task(
                 loss_replay_ce = criterion(pred, ry)
 
                 loss = (
-                        loss
-                        + loss_mse
-                        + der_replay_weight * loss_replay_ce
+                        loss_task
+                        + der_alpha * loss_mse
+                        + der_beta * loss_replay_ce
                 )
 
                 #
@@ -284,6 +319,7 @@ def train_task(
                     loss = loss + lambda_flux * loss_flux
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             running_loss += loss.item()
@@ -294,6 +330,25 @@ def train_task(
             n_batches += 1
         if scheduler is not None:
             scheduler.step()
+        epoch_time = time.time() - epoch_start
+        total_time = (time.time() - total_start) / 60.0
+
+        avg_loss = running_loss / n_batches
+        avg_task = running_task / n_batches
+        avg_mse = running_mse / n_batches
+        avg_replay_ce = running_replay_ce / n_batches
+        avg_flux = running_flux / n_batches
+
+        print(
+            f"Epoch {epoch + 1:2d}/{epochs} | "
+            f"Loss: {avg_loss:.4f} | "
+            f"Task: {avg_task:.4f} | "
+            f"MSE: {avg_mse:.4f} | "
+            f"ReplayCE: {avg_replay_ce:.4f} | "
+            f"Flux: {avg_flux:.4f} | "
+            f"Time: {epoch_time:5.1f}s | "
+            f"Total: {total_time:5.1f}m"
+        )
         logs.append({
             "epoch": epoch,
             "loss": running_loss / n_batches,
@@ -311,7 +366,9 @@ def evaluate(model, dataset, batch_size):
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
+        num_workers=8,
+        persistent_workers=True,
     )
 
     model.eval()
@@ -347,7 +404,8 @@ def run_condition(
         memory_per_task,
         use_flux_reg,
         lambda_flux,
-        der_replay_weight,
+        der_alpha,
+        der_beta,
         seed,
         out_dir,
 ):
@@ -383,7 +441,8 @@ def run_condition(
             dataset=train_taskset,
             replay_buffer=replay_buffer,
             lambda_flux=lambda_flux,
-            der_replay_weight=der_replay_weight,
+            der_alpha=der_alpha,
+            der_beta=der_beta,
             batch_size=cfg["batch_size"],
             epochs=cfg["epochs"],
             lr=cfg["lr"],
@@ -443,7 +502,8 @@ def run_condition(
         "seed": seed,
         "memory_per_task": memory_per_task,
         "replay_size": len(replay_buffer),
-        "der_replay_weight": der_replay_weight,
+        "der_alpha": der_alpha,
+        "der_beta": der_beta,
         "use_flux_reg": int(use_flux_reg),
         "lambda_flux": lambda_flux,
 
@@ -474,17 +534,12 @@ def main():
     parser.add_argument(
         "--lambda_grid",
         type=str,
-        default="0,0.03,0.1,0.3,1.0",
+        default="0,0.1,0.3,1.0,3.0",
     )
     parser.add_argument(
         "--seeds",
         type=str,
         default="0,1,2,3,4",
-    )
-    parser.add_argument(
-        "--der_replay_weight",
-        type=float,
-        default=2.0,
     )
 
 
@@ -493,6 +548,8 @@ def main():
         type=str,
         default=str(OUT),
     )
+    parser.add_argument("--der_alpha", type=float, default=0.1)
+    parser.add_argument("--der_beta", type=float, default=2.0)
 
     args = parser.parse_args()
     lambda_grid = [
@@ -516,31 +573,76 @@ def main():
 
     for seed in seeds:
 
+        results_csv = out_dir / f"results_seed_{seed}.csv"
+
+        # Load already completed conditions for this seed
+        completed = set()
+
+        if results_csv.exists():
+            existing = pd.read_csv(results_csv)
+
+            for _, row in existing.iterrows():
+                completed.add(
+                    (
+                        int(row["memory_per_task"]),
+                        float(row["lambda_flux"]),
+                    )
+                )
+
+            del existing
+            cleanup_memory()
+
         for lambda_flux in lambda_grid:
+
+            condition = (
+                int(memory_size),
+                float(lambda_flux),
+            )
+
+            if condition in completed:
+                print(
+                    f"SKIP: seed={seed} "
+                    f"memory={memory_size} "
+                    f"lambda={lambda_flux:g} already completed"
+                )
+                continue
+
+            cleanup_memory()
 
             result = run_condition(
                 dataset_name=args.dataset,
                 memory_per_task=memory_size,
                 use_flux_reg=(lambda_flux > 0),
                 lambda_flux=lambda_flux,
-                der_replay_weight=args.der_replay_weight,
+                der_alpha=args.der_alpha,
+                der_beta=args.der_beta,
                 seed=seed,
                 out_dir=out_dir,
             )
 
             results.append(result)
 
-            results_csv = out_dir / "results.csv"
+            mode = "a" if results_csv.exists() else "w"
 
-            with open(results_csv, "w", newline="") as f:
+            with open(results_csv, mode, newline="") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=list(results[0].keys()),
+                    fieldnames=result.keys(),
                 )
-                writer.writeheader()
-                writer.writerows(results)
+
+                if mode == "w":
+                    writer.writeheader()
+
+                writer.writerow(result)
+
+            completed.add(condition)
 
             print(f"saved: {results_csv}")
+
+            del result
+            cleanup_memory()
+
+        cleanup_memory()
 
     print()
     print("=" * 70)

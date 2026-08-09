@@ -66,7 +66,7 @@ def get_experiment_config(dataset_name):
                 num_classes=10
             ),
             "layer": "layer4",
-            "epochs": 40,
+            "epochs": 15,
             "batch_size": 128,
             "eval_batch_size": 256,
             "lr": 0.1,
@@ -517,7 +517,7 @@ def main():
     parser.add_argument(
         "--lambda_grid",
         type=str,
-        default="0,0.03,0.1,0.3,1.0",
+        default="0,0.1,0.3,1.0,3.0",
     )
     parser.add_argument(
         "--seeds",
@@ -588,44 +588,33 @@ def main():
 
             results.append(result)
             seed_results.append(result)
-            if args.dataset.lower() == "cifar10":
+            results_csv = out_dir / f"results_seed{seed}.csv"
 
-                results_csv = (
-                        out_dir
-                        / f"results_seed{seed}.csv"
-                )
 
-            else:
+            file_exists = results_csv.exists()
 
-                results_csv = (
-                        out_dir
-                        / "results.csv"
-                )
-
-            if args.dataset.lower() == "cifar10":
-                rows_to_write = seed_results
-            else:
-                rows_to_write = results
-
-            with open(results_csv, "w", newline="") as f:
+            with open(results_csv, "a", newline="") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=list(rows_to_write[0].keys()),
+                    fieldnames=list(result.keys()),
                 )
-                writer.writeheader()
-                writer.writerows(rows_to_write)
+
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerow(result)
 
             print(f"saved: {results_csv}")
 
-    print()
-    print("=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
+            print()
+            print("=" * 70)
+            print("SUMMARY")
+            print("=" * 70)
 
-    for row in results:
-        print(row)
+            for row in results:
+                print(row)
 
-    print(f"done: {out_dir}")
+            print(f"done: {out_dir}")
 
 
 if __name__ == "__main__":

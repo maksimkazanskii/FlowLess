@@ -3,6 +3,7 @@ import csv
 import json
 import random
 from pathlib import Path
+import gc
 
 import numpy as np
 import torch
@@ -28,6 +29,14 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = "cpu"
 
+def cleanup_memory():
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 def get_experiment_config(dataset_name):
 
@@ -79,8 +88,8 @@ def get_experiment_config(dataset_name):
             "model_factory": lambda: ResNet18(num_classes=200),
             "layer": "layer4",
             "epochs": 40,
-            "batch_size": 128,
-            "eval_batch_size": 256,
+            "batch_size": 64,
+            "eval_batch_size": 64,
             "lr": 0.1,
             "optimizer": "sgd",
             "replay_weight": 2.0,
@@ -229,9 +238,24 @@ def train_task(
     scheduler = None
 
     if optimizer_name == "sgd":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        warmup_epochs = 5
+
+        warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            T_max=epochs,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs - warmup_epochs,
+        )
+
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
         )
     criterion = nn.CrossEntropyLoss()
 
@@ -342,6 +366,15 @@ def train_task(
             "replay_ce": running_replay_ce / max(n_batches, 1),
             "flux_loss": running_flux / max(n_batches, 1),
         })
+
+        print(
+            f"Epoch {epoch + 1:3d}/{epochs} | "
+            f"Loss: {running_loss / max(n_batches, 1):.4f} | "
+            f"Task: {running_task / max(n_batches, 1):.4f} | "
+            f"Replay: {running_replay_ce / max(n_batches, 1):.4f} | "
+            f"Flux: {running_flux / max(n_batches, 1):.4f}",
+            flush=True,
+        )
 
     return logs
 
@@ -528,7 +561,7 @@ def main():
     parser.add_argument(
         "--lambda_grid",
         type=str,
-        default="0,0.03,0.1,0.3,1.0",
+        default="0,0.1,0.3,1.0,3.0",
     )
     parser.add_argument(
         "--seeds",
@@ -572,6 +605,7 @@ def main():
         seed_results = []
 
         for lambda_flux in lambda_grid:
+
             tag = (
                 f"seed{seed}_mem{memory_size}_"
                 f"lambda{lambda_flux:g}"
@@ -583,10 +617,12 @@ def main():
             )
 
             if acc_file.exists():
-
                 print(f"[SKIP] {tag}")
-
                 continue
+
+            # Clean memory before starting a new condition
+            cleanup_memory()
+
             result = run_condition(
                 dataset_name=args.dataset,
                 memory_per_task=memory_size,
@@ -599,34 +635,39 @@ def main():
 
             results.append(result)
             seed_results.append(result)
-            if args.dataset.lower() == "cifar10":
 
+            if args.dataset.lower() == "cifar10":
                 results_csv = (
                         out_dir
                         / f"results_seed{seed}.csv"
                 )
-
             else:
-
                 results_csv = (
                         out_dir
                         / "results.csv"
                 )
 
-            if args.dataset.lower() == "cifar10":
-                rows_to_write = seed_results
-            else:
-                rows_to_write = results
+            file_exists = results_csv.exists()
 
-            with open(results_csv, "w", newline="") as f:
+            with open(results_csv, "a", newline="") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=list(rows_to_write[0].keys()),
+                    fieldnames=list(result.keys()),
                 )
-                writer.writeheader()
-                writer.writerows(rows_to_write)
+
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerow(result)
 
             print(f"saved: {results_csv}")
+
+            # Release local reference and clear Python/device caches
+            del result
+            cleanup_memory()
+
+        # Extra cleanup between seeds
+        cleanup_memory()
 
     print()
     print("=" * 70)

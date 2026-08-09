@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/maksimkazanskii2/Desktop/Continual_density/src/flowless/regularizer_grid.py", line 719, in <module>
+    main()
+    ~~~~^^
+  File "/Users/maksimkazanskii2/Desktop/Continual_density/src/flowless/regularizer_grid.py", line 668, in main
+    result = run_condition(
+        dataset_name=args.dataset,
+    ...<6 lines>...
+        alpha=args.alpha,
+    )
+  File "/Users/maksimkazanskii2/Desktop/Continual_density/src/flowless/regularizer_grid.py", line 475, in run_condition
+    model = cfg["model_factory"]().to(DEVICE)
+            ~~~~~~~~~~~~~~~~~~~~^^
+  File "/Users/maksimkazanskii2/Desktop/Continual_density/src/flowless/regularizer_grid.py", line 61, in <lambda>
+    "model_factory": lambda: ResNet18(
+                             ~~~~~~~~^
+        num_classes=10,
+        ^^^^^^^^^^^^^^^
+        base_channels=32,
+        ^^^^^^^^^^^^^^^^^
+    ),
+    ^
+TypeError: ResNet18.__init__() got an unexpected keyword argument 'base_channels'
