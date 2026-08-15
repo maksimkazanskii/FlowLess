@@ -14,9 +14,27 @@ Legacy development code has been moved into dedicated `*_legacy` folders and is 
 
 ---
 
+## Citation
+
+If you find this repository useful, please cite
+
+```bibtex
+@article{kazanskii2026flowless,
+  title={Geometry of Forgetting: Representation Flux in Continual Learning},
+  author={Kazanskii, Maksim A.},
+  year={2026}
+}
+```
 ## Overview
 
 FlowLess-R is a lightweight representation-space regularizer for replay-based continual learning. Rather than constraining network parameters, FlowLess-R penalizes excessive displacement of latent representations stored in the replay buffer, encouraging stable representation dynamics while preserving the plasticity required to learn new tasks.
+
+## Main Findings
+
+Our experiments show that representation flux is associated with subsequent
+confidence degradation and catastrophic forgetting. Motivated by this
+observation, FlowLess-R constrains accumulated representation drift by anchoring
+replay samples to persistent historical representations.
 
 
 ## Benchmarks
@@ -246,7 +264,7 @@ Unless stated otherwise, all experiments use fixed random seeds and follow the e
 - **SplitMNIST:** `0, 1, 2, 3, 4, 5, 6, 7, 8, 9`
 - **SplitFashionMNIST:** `0, 1, 2, 3, 4, 5, 6, 7, 8, 9`
 - **SplitCIFAR10:** `0, 1, 2, 3, 4, 5, 6, 7, 8, 9`
-- **SplitTinyImageNet:** `0, 1, 2, 5, 6`
+- **SplitTinyImageNet:** `0, 1, 2, 4, 5`
 
 Unless otherwise specified, all reported results in the paper are presented as the mean ± standard deviation over these independent continual learning runs.
 
@@ -261,18 +279,30 @@ This repository accompanies the paper and provides
 - representation geometry analyses,
 - statistical evaluation,
 - generation of all figures and tables reported in the paper.
+
+## Results Data and Reproducibility
+
+The experimental result data used to produce the quantitative results reported
+in the paper are available on Zenodo:
+
+**Zenodo:** [link to Zenodo record]
+
+The archived data include the final result files used for statistical analysis,
+tables, and aggregate comparisons in the paper.
+
+Due to their substantially larger storage requirements, intermediate data
+generated during the representation-geometry investigations are not included
+in the archive. These files contain intermediate representations and other
+per-sample quantities used to construct the geometric analyses and figures and
+can be regenerated using the analysis scripts provided in this repository.
+
+Intermediate files from the SplitTinyImageNet experiments are also not
+included, as these experiments were executed on remote compute infrastructure
+and only the resulting experimental outputs required for the reported
+quantitative analyses were retained.
+
+
+
 ## License
 
 This project is released under the MIT License.
-
-## Citation
-
-If you find this repository useful, please cite
-
-```bibtex
-@article{kazanskii2026flowless,
-  title={Geometry of Forgetting: Representation Flux in Continual Learning},
-  author={Kazanskii, Maksim A.},
-  year={2026}
-}
-```
